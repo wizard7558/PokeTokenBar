@@ -62,6 +62,52 @@ final class DevinUsageTests: XCTestCase, @unchecked Sendable {
         XCTAssertEqual(empty.highWaterRowID, 5, "an empty incremental scan must retain its watermark")
     }
 
+    func testBranchCopiesWithSameMessageIDKeepMaximumMetrics() throws {
+        try seed(rows: [
+            Row(id: 1, payload: """
+            {"message_id":"shared","metadata":{"metrics":{"input_tokens":10,"output_tokens":20,\
+            "cache_read_tokens":30,"cache_creation_tokens":40}}}
+            """),
+            Row(id: 2, payload: """
+            {"message_id":"shared","metadata":{"metrics":{"input_tokens":1,"output_tokens":2,\
+            "cache_read_tokens":3,"cache_creation_tokens":4}}}
+            """),
+        ])
+        let result = scan()
+        XCTAssertEqual(result.entries.count, 1)
+        let entry = try XCTUnwrap(result.entries.first)
+        XCTAssertEqual(entry.id, "devin|\(databaseURL.path)|main|shared")
+        XCTAssertEqual(entry.input, 10)
+        XCTAssertEqual(entry.output, 20)
+        XCTAssertEqual(entry.cacheRead, 30)
+        XCTAssertEqual(entry.cacheWrite, 40)
+        XCTAssertEqual(entry.total, 100)
+        XCTAssertEqual(result.highWaterRowID, 2, "deduplication must not change the row watermark")
+    }
+
+    func testSameMessageIDInDifferentSessionsStaysDistinct() throws {
+        let payload = #"{"message_id":"shared","metadata":{"metrics":{"input_tokens":10}}}"#
+        try seed(rows: [
+            Row(id: 1, payload: payload),
+            Row(id: 2, sessionID: "sidekick", payload: payload),
+        ])
+        XCTAssertEqual(Set(scan().entries.map(\.id)), [
+            "devin|\(databaseURL.path)|main|shared",
+            "devin|\(databaseURL.path)|sidekick|shared",
+        ])
+    }
+
+    func testMetricsWithoutMessageIDUseUniqueRowFallbacks() throws {
+        try seed(rows: [Row(id: 1), Row(id: 2)])
+        let result = scan()
+        XCTAssertEqual(result.entries.count, 2)
+        XCTAssertEqual(Set(result.entries.map(\.id)), [
+            "devin|\(databaseURL.path)|main|row1",
+            "devin|\(databaseURL.path)|main|row2",
+        ])
+        XCTAssertEqual(result.entries.reduce(0) { $0 + $1.total }, turnTotal * 2)
+    }
+
     func testModelComesFromSessionJoinIncludingSidekickAndMissingSession() throws {
         try seed(rows: [
             Row(id: 1, payload: #"{"metadata":{"metrics":{"input_tokens":1}},"model":"wrong"}"#),
@@ -71,7 +117,9 @@ final class DevinUsageTests: XCTestCase, @unchecked Sendable {
         let entries = scan().entries
         let models = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0.model) })
         XCTAssertEqual(models, [
-            entryID(1): "swe-2-max", entryID(2): "fusion-swe-2-high", entryID(3): "unknown",
+            entryID(1): "swe-2-max",
+            entryID(2, sessionID: "sidekick"): "fusion-swe-2-high",
+            entryID(3, sessionID: "missing"): "unknown",
         ])
         XCTAssertEqual(entries.count, 3, "metrics mark usage without requiring a role or excluding sidekicks")
     }
@@ -240,6 +288,23 @@ final class DevinUsageTests: XCTestCase, @unchecked Sendable {
                        "reset must replace existing rows, not keep-max against reused ids")
     }
 
+    func testProviderMergesBranchCopiesAcrossIncrementalScans() async throws {
+        let (provider, clock) = try makeProvider()
+        let createdAt = Int64(clock.now.timeIntervalSince1970)
+        try seed(rows: [Row(id: 1, createdAt: createdAt,
+                            payload: #"{"message_id":"shared","metadata":{"metrics":{"input_tokens":10}}}"#)])
+        let first = try await provider.fetchDaily()
+        XCTAssertEqual(first?.totalTokens, 10)
+
+        try insert(rows: [Row(id: 2, createdAt: createdAt,
+                              payload: #"{"message_id":"shared","metadata":{"metrics":{"input_tokens":20}}}"#)])
+        clock.now += 31
+        let second = try await provider.fetchDaily()
+        XCTAssertEqual(second?.totalTokens, 20, "branch copies must merge with cached usage, not add to it")
+        let enrichment = await provider.fetchEnrichment()
+        XCTAssertEqual(enrichment.monthTotal?.totalTokens, 20)
+    }
+
     func testUnreadableDatabaseRetainsCachedUsageWithoutThrowingOrResetting() async throws {
         let (provider, clock) = try makeProvider()
         try seed(rows: [Row(id: 1, createdAt: Int64(clock.now.timeIntervalSince1970))])
@@ -289,8 +354,8 @@ final class DevinUsageTests: XCTestCase, @unchecked Sendable {
         LocalAdditionalUsageReader.devinEntries(modifiedSince: since, roots: [root])
     }
 
-    private func entryID(_ id: Int64, in database: URL? = nil) -> String {
-        "devin|\((database ?? databaseURL).path)|\(id)"
+    private func entryID(_ id: Int64, sessionID: String = "main", in database: URL? = nil) -> String {
+        "devin|\((database ?? databaseURL).path)|\(sessionID)|row\(id)"
     }
 
     private struct Row {

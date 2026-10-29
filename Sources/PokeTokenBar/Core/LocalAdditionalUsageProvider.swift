@@ -1158,7 +1158,7 @@ enum LocalAdditionalUsageReader {
                 let cutoff = Int64(since.timeIntervalSince1970) - 86_400
                 return IncrementalRowQuery(
                     sql: """
-                    SELECT m.row_id, m.chat_message, m.created_at, s.model
+                    SELECT m.row_id, m.chat_message, m.session_id, m.created_at, s.model
                     FROM message_nodes m LEFT JOIN sessions s ON s.id = m.session_id
                     WHERE m.row_id > ?1 AND m.created_at >= \(cutoff)
                     """,
@@ -1170,12 +1170,15 @@ enum LocalAdditionalUsageReader {
                       let object = jsonObject(data: Data(payload.utf8)),
                       let metadata = object["metadata"] as? Object,
                       let metrics = metadata["metrics"] as? Object,
-                      let date = dateValue(sqlite3_column_double(statement, 2)) else { return nil }
+                      let date = dateValue(sqlite3_column_double(statement, 3)) else { return nil }
+                let sessionID = columnText(statement, 2)
+                let messageID = stringValue(object["message_id"])
+                // Branch copies have new row IDs but retain the logical message ID.
                 // Devin's input already excludes both cache buckets, unlike Copilot.
                 return makeEntry(
-                    id: "devin|\(database.path)|\(rowID)",
+                    id: "devin|\(database.path)|\(sessionID ?? "nosession")|\(messageID ?? "row\(rowID)")",
                     date: date,
-                    model: stringValue(columnText(statement, 3)) ?? "unknown",
+                    model: stringValue(columnText(statement, 4)) ?? "unknown",
                     input: intValue(metrics["input_tokens"]),
                     output: intValue(metrics["output_tokens"]),
                     cacheWrite: intValue(metrics["cache_creation_tokens"]),
